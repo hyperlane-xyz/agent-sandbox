@@ -44,8 +44,9 @@ import (
 )
 
 const (
-	sandboxTemplateRefHash = "agents.x-k8s.io/sandbox-template-ref-hash"
-	warmPoolSandboxLabel   = "agents.x-k8s.io/warm-pool-sandbox"
+	sandboxTemplateRefHash       = "agents.x-k8s.io/sandbox-template-ref-hash"
+	warmPoolSandboxLabel         = "agents.x-k8s.io/warm-pool-sandbox"
+	warmPoolReadinessGracePeriod = 15 * time.Minute
 )
 
 // SandboxWarmPoolReconciler reconciles a SandboxWarmPool object.
@@ -123,8 +124,6 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 
 	// Delete stale pods, filter pods by ownership and adopt orphans
 	activeSandboxes, allErrors := r.filterActiveSandboxes(ctx, warmPool, sandboxList.Items, template, currentPodTemplateHash, tmplErr)
-
-	const warmPoolReadinessGracePeriod = 5 * time.Minute
 
 	now := time.Now()
 	var healthySandboxes []sandboxv1alpha1.Sandbox

@@ -683,8 +683,8 @@ func TestReconcilePoolGCStuckSandboxes(t *testing.T) {
 				WithScheme(scheme).
 				WithRuntimeObjects(
 					template,
-					createSandboxWithAge("-stuck", metav1.ConditionFalse, 10*time.Minute),
-					createSandboxWithAge("-healthy", metav1.ConditionTrue, 10*time.Minute),
+					createSandboxWithAge("-stuck", metav1.ConditionFalse, 20*time.Minute),
+					createSandboxWithAge("-healthy", metav1.ConditionTrue, 20*time.Minute),
 				).
 				Build(),
 			Scheme: scheme,
@@ -715,8 +715,8 @@ func TestReconcilePoolGCStuckSandboxes(t *testing.T) {
 				WithScheme(scheme).
 				WithRuntimeObjects(
 					template,
-					createSandboxWithAge("-starting", metav1.ConditionFalse, 2*time.Minute),
-					createSandboxWithAge("-healthy", metav1.ConditionTrue, 10*time.Minute),
+					createSandboxWithAge("-starting", metav1.ConditionFalse, 10*time.Minute),
+					createSandboxWithAge("-healthy", metav1.ConditionTrue, 20*time.Minute),
 				).
 				Build(),
 			Scheme: scheme,
