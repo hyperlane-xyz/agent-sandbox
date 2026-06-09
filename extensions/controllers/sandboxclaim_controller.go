@@ -57,6 +57,7 @@ import (
 
 const ObservabilityAnnotation = "agents.x-k8s.io/controller-first-observed-at"
 const immediateRequeueDelay = time.Millisecond
+const warmPoolReadyRequeueDelay = time.Second
 
 // ErrTemplateNotFound is a sentinel error indicating a SandboxTemplate was not found.
 var ErrTemplateNotFound = errors.New("SandboxTemplate not found")
@@ -66,6 +67,9 @@ var ErrInvalidMetadata = errors.New("invalid additionalPodMetadata")
 
 // ErrSandboxNotOwned indicates the Sandbox exists but is not controlled by this claim.
 var ErrSandboxNotOwned = errors.New("sandbox not owned by this claim")
+
+// ErrNoReadyWarmPoolSandbox indicates a specific warm pool has no ready sandbox to adopt.
+var ErrNoReadyWarmPoolSandbox = errors.New("no ready sandbox available in requested warm pool")
 
 var restrictedDomains = []string{"kubernetes.io", "k8s.io", "agents.x-k8s.io"}
 
@@ -271,6 +275,11 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{RequeueAfter: requeueDelay}, nil
 	}
 
+	if errors.Is(reconcileErr, ErrNoReadyWarmPoolSandbox) {
+		logger.V(1).Info("Requested warm pool has no ready sandbox yet", "warmpool", getWarmPoolPolicy(claim), "claim", claim.Name)
+		return ctrl.Result{RequeueAfter: warmPoolReadyRequeueDelay}, nil
+	}
+
 	// Suppress invalid metadata and ownership errors to avoid crash loops
 	if errors.Is(reconcileErr, ErrInvalidMetadata) || errors.Is(reconcileErr, ErrSandboxNotOwned) {
 		logger.V(1).Info("Sandboxclaim suppressed error(s) encountered", "error", reconcileErr, "request", req.NamespacedName)
@@ -372,6 +381,10 @@ func (r *SandboxClaimReconciler) reconcileActive(ctx context.Context, claim *ext
 			}
 		}
 		return sandbox, nil
+	}
+
+	if getWarmPoolPolicy(claim).IsSpecificPool() {
+		return nil, ErrNoReadyWarmPoolSandbox
 	}
 
 	// Cold path: no existing sandbox or warm pool candidate.
@@ -476,6 +489,15 @@ func (r *SandboxClaimReconciler) computeReadyCondition(claim *extensionsv1alpha1
 				Status:             metav1.ConditionFalse,
 				Reason:             extensionsv1alpha1.ClaimExpiredReason,
 				Message:            fmt.Sprintf("Claim expired. %v; deletion skipped.", err),
+				ObservedGeneration: claim.Generation,
+			}
+		}
+		if errors.Is(err, ErrNoReadyWarmPoolSandbox) {
+			return metav1.Condition{
+				Type:               string(v1alpha1.SandboxConditionReady),
+				Status:             metav1.ConditionFalse,
+				Reason:             "WaitingForReadyWarmPoolSandbox",
+				Message:            err.Error(),
 				ObservedGeneration: claim.Generation,
 			}
 		}
@@ -1505,6 +1527,9 @@ func isAdoptable(candidate *v1alpha1.Sandbox) error {
 	controllerRef := metav1.GetControllerOf(candidate)
 	if controllerRef != nil && controllerRef.Kind != "SandboxWarmPool" {
 		return fmt.Errorf("sandbox is not managed by warm pool. Controller: %v", controllerRef)
+	}
+	if !isSandboxReady(candidate) {
+		return fmt.Errorf("sandbox is not ready")
 	}
 	return nil
 }

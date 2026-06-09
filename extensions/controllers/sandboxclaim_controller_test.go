@@ -1717,7 +1717,7 @@ func TestSandboxClaimSandboxAdoption(t *testing.T) {
 			expectNewSandboxCreated: true,
 		},
 		{
-			name: "adopts sandboxes from queue regardless of ready state",
+			name: "adopts a ready sandbox instead of an older unready sandbox",
 			existingObjects: []client.Object{
 				template,
 				claim,
@@ -1726,20 +1726,19 @@ func TestSandboxClaimSandboxAdoption(t *testing.T) {
 				createWarmPoolSandbox("young-ready", metav1.Now(), true),
 			},
 			expectSandboxAdoption:   true,
-			expectedAdoptedSandbox:  "not-ready",
+			expectedAdoptedSandbox:  "middle-ready",
 			expectNewSandboxCreated: false,
 		},
 		{
-			name: "adopts first available non-ready sandbox from queue",
+			name: "creates a sandbox for the default policy when no ready warm sandbox exists",
 			existingObjects: []client.Object{
 				template,
 				claim,
 				createWarmPoolSandbox("not-ready-1", metav1.Time{Time: metav1.Now().Add(-2 * time.Hour)}, false),
 				createWarmPoolSandbox("not-ready-2", metav1.Time{Time: metav1.Now().Add(-1 * time.Hour)}, false),
 			},
-			expectSandboxAdoption:   true,
-			expectedAdoptedSandbox:  "not-ready-1",
-			expectNewSandboxCreated: false,
+			expectSandboxAdoption:   false,
+			expectNewSandboxCreated: true,
 		},
 		{
 			name: "corrects stale pod-name annotation when adopting sandbox",
@@ -1903,6 +1902,97 @@ func TestSandboxClaimSandboxAdoption(t *testing.T) {
 		})
 	}
 }
+
+func TestSpecificWarmPoolClaimWaitsForReadySandbox(t *testing.T) {
+	scheme := newScheme(t)
+	poolName := extensionsv1alpha1.WarmPoolPolicy("test-pool")
+	claim := &extensionsv1alpha1.SandboxClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-claim",
+			Namespace: "default",
+			UID:       "claim-uid",
+		},
+		Spec: extensionsv1alpha1.SandboxClaimSpec{
+			TemplateRef: extensionsv1alpha1.SandboxTemplateRef{Name: "test-template"},
+			WarmPool:    &poolName,
+		},
+	}
+	template := &extensionsv1alpha1.SandboxTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-template", Namespace: "default"},
+		Spec: extensionsv1alpha1.SandboxTemplateSpec{
+			PodTemplate: sandboxv1alpha1.PodTemplate{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "worker", Image: "test-image"}},
+				},
+			},
+		},
+	}
+	replicas := int32(1)
+	unready := &sandboxv1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pool-unready",
+			Namespace: "default",
+			Labels: map[string]string{
+				warmPoolSandboxLabel:   sandboxcontrollers.NameHash(string(poolName)),
+				sandboxTemplateRefHash: sandboxcontrollers.NameHash(template.Name),
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: extensionsv1alpha1.GroupVersion.String(),
+				Kind:       "SandboxWarmPool",
+				Name:       string(poolName),
+				UID:        "pool-uid",
+				Controller: new(true),
+			}},
+		},
+		Spec: sandboxv1alpha1.SandboxSpec{
+			Replicas: &replicas,
+			PodTemplate: sandboxv1alpha1.PodTemplate{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "worker", Image: "test-image"}},
+				},
+			},
+		},
+		Status: sandboxv1alpha1.SandboxStatus{
+			Conditions: []metav1.Condition{{
+				Type:   string(sandboxv1alpha1.SandboxConditionReady),
+				Status: metav1.ConditionFalse,
+				Reason: "DependenciesNotReady",
+			}},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(claim, template, unready).
+		WithStatusSubresource(claim).
+		Build()
+	reconciler := &SandboxClaimReconciler{
+		Client:           fakeClient,
+		Scheme:           scheme,
+		Recorder:         events.NewFakeRecorder(10),
+		WarmSandboxQueue: queue.NewSimpleSandboxQueue(),
+		Tracer:           asmetrics.NewNoOp(),
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace},
+	})
+	require.NoError(t, err)
+	require.Equal(t, warmPoolReadyRequeueDelay, result.RequeueAfter)
+
+	var coldSandbox sandboxv1alpha1.Sandbox
+	err = fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: claim.Name, Namespace: claim.Namespace,
+	}, &coldSandbox)
+	require.True(t, k8errors.IsNotFound(err), "specific-pool claim must not cold-create a sandbox")
+
+	var updatedClaim extensionsv1alpha1.SandboxClaim
+	require.NoError(t, fakeClient.Get(context.Background(), client.ObjectKeyFromObject(claim), &updatedClaim))
+	ready := meta.FindStatusCondition(updatedClaim.Status.Conditions, string(sandboxv1alpha1.SandboxConditionReady))
+	require.NotNil(t, ready)
+	require.Equal(t, metav1.ConditionFalse, ready.Status)
+	require.Equal(t, "WaitingForReadyWarmPoolSandbox", ready.Reason)
+}
+
 func TestSandboxEventHandler_Delete_RemovesGhostPods(t *testing.T) {
 	q := queue.NewSimpleSandboxQueue()
 	handler := &sandboxEventHandler{sandboxQueue: q}
@@ -2569,7 +2659,7 @@ func TestSandboxClaimWarmPoolPolicy(t *testing.T) {
 		}
 	})
 
-	t.Run("falls back to cold start when specific pool has no sandboxes", func(t *testing.T) {
+	t.Run("waits when specific pool has no ready sandboxes", func(t *testing.T) {
 		scheme := newScheme(t)
 		claimWithSpecificPool := baseClaim.DeepCopy()
 		specificPool := extensionsv1alpha1.WarmPoolPolicy("nonexistent-pool")
@@ -2603,15 +2693,18 @@ func TestSandboxClaimWarmPoolPolicy(t *testing.T) {
 		}
 
 		ctx := context.Background()
-		_, err := reconciler.Reconcile(ctx, req)
+		result, err := reconciler.Reconcile(ctx, req)
 		if err != nil {
 			t.Fatalf("reconcile failed: %v", err)
 		}
+		if result.RequeueAfter != warmPoolReadyRequeueDelay {
+			t.Fatalf("expected requeue after %v, got %v", warmPoolReadyRequeueDelay, result.RequeueAfter)
+		}
 
-		// Verify a new sandbox was created via cold start
+		// Verify no sandbox was created via cold start.
 		var sandbox sandboxv1alpha1.Sandbox
-		if err := fakeClient.Get(ctx, req.NamespacedName, &sandbox); err != nil {
-			t.Fatalf("expected sandbox to be created but got error: %v", err)
+		if err := fakeClient.Get(ctx, req.NamespacedName, &sandbox); !k8errors.IsNotFound(err) {
+			t.Fatalf("expected no cold sandbox, got error: %v", err)
 		}
 
 		// Verify the existing pool sandbox was NOT adopted
@@ -3241,6 +3334,12 @@ func TestVerifySandboxCandidate_NamespaceIsolation(t *testing.T) {
 				Kind: "SandboxWarmPool",
 			}},
 		},
+		Status: sandboxv1alpha1.SandboxStatus{
+			Conditions: []metav1.Condition{{
+				Type:   string(sandboxv1alpha1.SandboxConditionReady),
+				Status: metav1.ConditionTrue,
+			}},
+		},
 	}
 
 	// 2. Invalid Sandbox (Different Namespace, but identical hash)
@@ -3254,6 +3353,12 @@ func TestVerifySandboxCandidate_NamespaceIsolation(t *testing.T) {
 			},
 			OwnerReferences: []metav1.OwnerReference{{
 				Kind: "SandboxWarmPool",
+			}},
+		},
+		Status: sandboxv1alpha1.SandboxStatus{
+			Conditions: []metav1.Condition{{
+				Type:   string(sandboxv1alpha1.SandboxConditionReady),
+				Status: metav1.ConditionTrue,
 			}},
 		},
 	}

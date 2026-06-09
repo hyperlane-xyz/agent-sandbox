@@ -48,6 +48,41 @@ All standard tasks go through the [Makefile](Makefile). Prefer `make` targets ov
 
 After editing anything in [api/](api/), [extensions/api/](extensions/api/), or kubebuilder markers in [controllers/](controllers/) / [extensions/controllers/](extensions/controllers/), run `make all` (or at least `make fix-go-generate`) to regenerate CRDs in [k8s/crds/](k8s/crds/), RBAC manifests in [k8s/](k8s/), deepcopy code, and the typed clients. The exact directives live in [codegen.go](codegen.go). Commit the regenerated output alongside the source change — never hand-edit `zz_generated_*.go`, `*.generated.yaml`, or files under [clients/k8s/](clients/k8s/).
 
+## Hyperlane image releases
+
+Build Hyperlane controller releases from a clean, pushed commit on
+`hyperlane/v0.4.6-readiness-grace`. Increment the immutable
+`v0.4.6-hyperlane.N` tag for every release and embed the matching commit SHA:
+
+```bash
+VERSION=v0.4.6-hyperlane.2
+SHA=$(git rev-parse --short HEAD)
+
+docker buildx build \
+  --platform linux/amd64 \
+  --build-arg GIT_VERSION="$VERSION" \
+  --build-arg GIT_SHA="$SHA" \
+  --tag "ghcr.io/hyperlane-xyz/agent-sandbox-controller:$VERSION" \
+  --push .
+
+docker buildx imagetools inspect \
+  "ghcr.io/hyperlane-xyz/agent-sandbox-controller:$VERSION"
+```
+
+Release by updating only the cluster-wide controller deployment:
+
+```bash
+kubectl -n agent-sandbox-system set image \
+  deployment/agent-sandbox-controller \
+  "agent-sandbox-controller=ghcr.io/hyperlane-xyz/agent-sandbox-controller:$VERSION"
+
+kubectl -n agent-sandbox-system rollout status \
+  deployment/agent-sandbox-controller --timeout=5m
+```
+
+Do not modify, restart, scale, claim, or delete Haggis sandbox resources as part
+of a controller image release.
+
 ## Docs site mounts
 
 The Hugo site at [site/](site/) mounts these repo paths into `assets/additional/` and surfaces them on https://agent-sandbox.sigs.k8s.io. **Edits to these files change the public docs site**, so treat them as documentation, not just internal READMEs:
