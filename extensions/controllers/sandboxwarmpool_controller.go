@@ -46,7 +46,7 @@ import (
 const (
 	sandboxTemplateRefHash       = "agents.x-k8s.io/sandbox-template-ref-hash"
 	warmPoolSandboxLabel         = "agents.x-k8s.io/warm-pool-sandbox"
-	warmPoolReadinessGracePeriod = 15 * time.Minute
+	warmPoolReadinessGracePeriod = 30 * time.Minute
 )
 
 // SandboxWarmPoolReconciler reconciles a SandboxWarmPool object.
