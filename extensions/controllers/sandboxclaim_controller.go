@@ -452,7 +452,13 @@ func (r *SandboxClaimReconciler) updateStatus(ctx context.Context, oldStatus *ex
 		return nil
 	}
 
-	if err := r.Status().Update(ctx, claim); err != nil {
+	// Status reconciliation may race with metadata patches performed by this
+	// controller (for example, warm-pool adoption labels) or another actor. A
+	// merge patch applies only the status delta and does not fail merely because
+	// the cached object carries an older resourceVersion.
+	oldClaim := claim.DeepCopy()
+	oldClaim.Status = *oldStatus.DeepCopy()
+	if err := r.Status().Patch(ctx, claim, client.MergeFrom(oldClaim)); err != nil {
 		logger.Error(err, "Failed to update sandboxclaim status")
 		return err
 	}
@@ -566,10 +572,27 @@ func (r *SandboxClaimReconciler) computeAndSetStatus(claim *extensionsv1alpha1.S
 	if sandbox != nil {
 		claim.Status.SandboxStatus.Name = sandbox.Name
 		claim.Status.SandboxStatus.PodIPs = sandbox.Status.PodIPs
-	} else {
+	} else if !preserveEstablishedSandboxBinding(claim, err, isClaimExpired) {
 		claim.Status.SandboxStatus.Name = ""
 		claim.Status.SandboxStatus.PodIPs = nil
 	}
+}
+
+// preserveEstablishedSandboxBinding prevents a transient read/reconcile error
+// from erasing an already-persisted Claim-to-Sandbox assignment. The binding is
+// retained only while metadata still supplies the same durable identity: cold
+// Sandboxes use the Claim name, while adopted Sandboxes use the assignment
+// label. Authoritative expiry, a removed stale label, or a successful reconcile
+// that finds no Sandbox may still clear it.
+func preserveEstablishedSandboxBinding(claim *extensionsv1alpha1.SandboxClaim, err error, isClaimExpired bool) bool {
+	name := claim.Status.SandboxStatus.Name
+	if name == "" || err == nil || isClaimExpired {
+		return false
+	}
+	if name == claim.Name {
+		return true
+	}
+	return claim.Labels[extensionsv1alpha1.AssignedSandboxNameLabel] == name
 }
 
 func (r *SandboxClaimReconciler) syncFinishedCondition(claim *extensionsv1alpha1.SandboxClaim, sandbox *v1alpha1.Sandbox, isClaimExpired bool) {
@@ -1121,8 +1144,11 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 							return nil, fmt.Errorf("failed to complete adoption of %q: %w", sbName, err)
 						}
 					} else {
-						// If succeeded, return error to retry so next reconcile sees it controlled by us!
-						return nil, fmt.Errorf("triggered adoption completion for %q: retrying", sbName)
+						// completeAdoption patched this exact object and mutated the
+						// local copy to the authoritative Claim ownership. Returning it
+						// avoids an artificial nil-binding window while the informer
+						// cache catches up.
+						return sandbox, nil
 					}
 				}
 

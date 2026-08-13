@@ -3378,8 +3378,8 @@ func TestVerifySandboxCandidate_NamespaceIsolation(t *testing.T) {
 }
 
 // TestSandboxClaimPreventsDuplicateAdoptionDuringCacheLag verifies that during informer cache lag,
-// the assigned sandbox label on the claim is used to identify the previously adopted Sandbox,
-// preventing duplicate adoptions from the warm pool.
+// the controller completes the recorded adoption and publishes the binding in the same reconcile,
+// preventing both a transient empty status and duplicate warm-pool adoption.
 func TestSandboxClaimPreventsDuplicateAdoptionDuringCacheLag(t *testing.T) {
 	scheme := newScheme(t)
 
@@ -3479,23 +3479,21 @@ func TestSandboxClaimPreventsDuplicateAdoptionDuringCacheLag(t *testing.T) {
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-claim", Namespace: "default"}}
 
-	// Run reconcile
+	// Run reconcile. completeAdoption's successful API patch is authoritative;
+	// the reconciler must not wait for a later cache observation to publish it.
 	_, err := reconciler.Reconcile(context.Background(), req)
-	expectedErr := "triggered adoption completion for \"adopted-sb\": retrying"
-	if err == nil {
-		t.Fatal("Expected reconcile to fail with cache lag error, but it succeeded")
-	} else if err.Error() != expectedErr {
-		t.Errorf("Expected error %q, got: %q", expectedErr, err.Error())
+	if err != nil {
+		t.Fatalf("Expected reconcile to complete adoption without a cache-lag error, got: %v", err)
 	}
 
-	// Verify that the claim status was NOT updated with the sandbox name (due to error)
+	// Verify that the claim status was updated without an empty-binding window.
 	updatedClaim := &extensionsv1alpha1.SandboxClaim{}
 	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-claim", Namespace: "default"}, updatedClaim); err != nil {
 		t.Fatalf("failed to get claim: %v", err)
 	}
 
-	if updatedClaim.Status.SandboxStatus.Name == "adopted-sb" {
-		t.Error("expected claim status to NOT be updated with 'adopted-sb' during cache lag")
+	if updatedClaim.Status.SandboxStatus.Name != "adopted-sb" {
+		t.Errorf("expected claim status to be updated with 'adopted-sb', got %q", updatedClaim.Status.SandboxStatus.Name)
 	}
 
 	// Verify that the extra warm sandbox was NOT adopted (it should still have its warm pool labels)
@@ -3507,35 +3505,18 @@ func TestSandboxClaimPreventsDuplicateAdoptionDuringCacheLag(t *testing.T) {
 		t.Error("expected extra warm sandbox to still have warm pool label, meaning it was not incorrectly adopted during cache lag")
 	}
 
-	// Simulate the cache catching up!
-	// Fetch the adopted sandbox object, add the SandboxClaim owner reference, and update it in fakeClient.
-	var adopted sandboxv1alpha1.Sandbox
-	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "adopted-sb", Namespace: "default"}, &adopted); err != nil {
-		t.Fatalf("failed to get adopted sandbox: %v", err)
-	}
-	adopted.OwnerReferences = []metav1.OwnerReference{{
-		APIVersion: "extensions.agents.x-k8s.io/v1alpha1",
-		Kind:       "SandboxClaim",
-		Name:       "test-claim",
-		UID:        "claim-uid-123",
-		Controller: ptr.To(true), // nolint:modernize
-	}}
-	if err := fakeClient.Update(context.Background(), &adopted); err != nil {
-		t.Fatalf("failed to update adopted sandbox with claim owner ref: %v", err)
-	}
-
-	// Run reconcile AGAIN
+	// A later cache-converged reconcile remains idempotent.
 	_, err = reconciler.Reconcile(context.Background(), req)
 	if err != nil {
 		t.Fatalf("Expected second Reconcile to succeed after cache caught up, but failed: %v", err)
 	}
 
-	// Verify that the claim status WAS updated this time!
+	// Verify that the claim status remains bound.
 	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-claim", Namespace: "default"}, updatedClaim); err != nil {
 		t.Fatalf("failed to get claim: %v", err)
 	}
 	if updatedClaim.Status.SandboxStatus.Name != "adopted-sb" {
-		t.Errorf("expected claim status to be updated with 'adopted-sb' on 2nd pass, got %q", updatedClaim.Status.SandboxStatus.Name)
+		t.Errorf("expected claim status to remain 'adopted-sb' on 2nd pass, got %q", updatedClaim.Status.SandboxStatus.Name)
 	}
 
 	// Verify that the extra warm sandbox was STILL NOT adopted (it should still have its warm pool labels)
@@ -3544,6 +3525,123 @@ func TestSandboxClaimPreventsDuplicateAdoptionDuringCacheLag(t *testing.T) {
 	}
 	if _, ok := extra.Labels[warmPoolSandboxLabel]; !ok {
 		t.Error("expected extra warm sandbox to still have warm pool label after 2nd pass (should not have been adopted)")
+	}
+}
+
+func TestSandboxClaimPreservesEstablishedBindingOnTransientError(t *testing.T) {
+	tests := []struct {
+		name    string
+		claim   *extensionsv1alpha1.SandboxClaim
+		err     error
+		expired bool
+		want    string
+	}{
+		{
+			name: "adopted sandbox retains matching assignment label",
+			claim: &extensionsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "claim",
+					Labels: map[string]string{extensionsv1alpha1.AssignedSandboxNameLabel: "warm-sandbox"},
+				},
+				Status: extensionsv1alpha1.SandboxClaimStatus{
+					SandboxStatus: extensionsv1alpha1.SandboxStatus{Name: "warm-sandbox"},
+				},
+			},
+			err:  errors.New("transient cache read"),
+			want: "warm-sandbox",
+		},
+		{
+			name: "cold sandbox retains deterministic claim name",
+			claim: &extensionsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "claim"},
+				Status: extensionsv1alpha1.SandboxClaimStatus{
+					SandboxStatus: extensionsv1alpha1.SandboxStatus{Name: "claim"},
+				},
+			},
+			err:  errors.New("transient api error"),
+			want: "claim",
+		},
+		{
+			name: "removed stale assignment permits authoritative clear",
+			claim: &extensionsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "claim"},
+				Status: extensionsv1alpha1.SandboxClaimStatus{
+					SandboxStatus: extensionsv1alpha1.SandboxStatus{Name: "missing-warm-sandbox"},
+				},
+			},
+			err:  ErrNoReadyWarmPoolSandbox,
+			want: "",
+		},
+		{
+			name: "expiry permits authoritative clear",
+			claim: &extensionsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "claim",
+					Labels: map[string]string{extensionsv1alpha1.AssignedSandboxNameLabel: "warm-sandbox"},
+				},
+				Status: extensionsv1alpha1.SandboxClaimStatus{
+					SandboxStatus: extensionsv1alpha1.SandboxStatus{Name: "warm-sandbox"},
+				},
+			},
+			err:     errors.New("cleanup retry"),
+			expired: true,
+			want:    "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reconciler := &SandboxClaimReconciler{}
+			reconciler.computeAndSetStatus(tt.claim, nil, tt.err, tt.expired)
+			if got := tt.claim.Status.SandboxStatus.Name; got != tt.want {
+				t.Fatalf("binding = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSandboxClaimStatusPatchToleratesConcurrentMetadataUpdate(t *testing.T) {
+	scheme := newScheme(t)
+	claim := &extensionsv1alpha1.SandboxClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "claim", Namespace: "default"},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(claim).
+		WithStatusSubresource(claim).
+		Build()
+
+	stale := &extensionsv1alpha1.SandboxClaim{}
+	key := types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}
+	if err := fakeClient.Get(context.Background(), key, stale); err != nil {
+		t.Fatalf("get stale claim: %v", err)
+	}
+	oldStatus := stale.Status.DeepCopy()
+	stale.Status.SandboxStatus.Name = "sandbox-1"
+
+	concurrent := &extensionsv1alpha1.SandboxClaim{}
+	if err := fakeClient.Get(context.Background(), key, concurrent); err != nil {
+		t.Fatalf("get concurrent claim: %v", err)
+	}
+	concurrent.Labels = map[string]string{"example.com/concurrent": "true"}
+	if err := fakeClient.Update(context.Background(), concurrent); err != nil {
+		t.Fatalf("concurrent metadata update: %v", err)
+	}
+
+	reconciler := &SandboxClaimReconciler{Client: fakeClient}
+	if err := reconciler.updateStatus(context.Background(), oldStatus, stale); err != nil {
+		t.Fatalf("status patch after concurrent metadata update: %v", err)
+	}
+
+	updated := &extensionsv1alpha1.SandboxClaim{}
+	if err := fakeClient.Get(context.Background(), key, updated); err != nil {
+		t.Fatalf("get updated claim: %v", err)
+	}
+	if got := updated.Status.SandboxStatus.Name; got != "sandbox-1" {
+		t.Fatalf("status binding = %q, want sandbox-1", got)
+	}
+	if got := updated.Labels["example.com/concurrent"]; got != "true" {
+		t.Fatalf("concurrent metadata = %q, want true", got)
 	}
 }
 
